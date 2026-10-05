@@ -1,0 +1,163 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// =========================================================================
+// ENUMS
+// =========================================================================
+
+enum Role {
+  ADMIN
+  USER
+}
+
+enum SenderProvider {
+  ETHEREAL
+  SMTP
+  GOOGLE
+}
+
+enum EmailJobStatus {
+  SCHEDULED
+  PROCESSING
+  SENT
+  FAILED
+  RESCHEDULED
+}
+
+// =========================================================================
+// TENANT & MULTI-TENANCY MODEL
+// =========================================================================
+
+model Tenant {
+  id                String             @id @default(uuid())
+  name              String
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  users             User[]
+  senderAccounts    SenderAccount[]
+  emailJobs         EmailJob[]
+  slackIntegrations SlackIntegration[]
+
+  @@map("tenants")
+}
+
+// =========================================================================
+// USER & AUTHENTICATION MODEL (Google OAuth 2.0 / JWT)
+// =========================================================================
+
+model User {
+  id                String             @id @default(uuid())
+  email             String             @unique
+  name              String?
+  avatarUrl         String?
+  googleId          String?            @unique
+  role              Role               @default(USER)
+  tenantId          String
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  emailJobs         EmailJob[]
+  slackIntegrations SlackIntegration[]
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+// =========================================================================
+// SENDER ACCOUNT MODEL (Ethereal / SMTP throttling configurations)
+// =========================================================================
+
+model SenderAccount {
+  id              String          @id @default(uuid())
+  tenantId        String
+  tenant          Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  email           String
+  name            String?
+  provider        SenderProvider  @default(ETHEREAL)
+  hourlyLimit     Int             @default(50)  // MAX_EMAILS_PER_HOUR_PER_SENDER
+  minDelaySeconds Int             @default(2)   // Per-email provider throttle delay
+  credentials     Json?           // Encrypted credentials or cached Ethereal credentials
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  emailJobs       EmailJob[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("sender_accounts")
+}
+
+// =========================================================================
+// EMAIL JOB MODEL (Persistent Queue Task & Zero-Cron Idempotency)
+// =========================================================================
+
+model EmailJob {
+  id                 String          @id @default(uuid())
+  idempotencyKey     String          @unique // UUID matching BullMQ jobId
+  tenantId           String
+  tenant             Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId             String
+  user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  senderAccountId    String
+  senderAccount      SenderAccount   @relation(fields: [senderAccountId], references: [id], onDelete: Cascade)
+
+  recipient          String
+  subject            String
+  body               String          @db.Text
+  status             EmailJobStatus  @default(SCHEDULED)
+  scheduledAt        DateTime
+  sentAt             DateTime?
+  failedAt           DateTime?
+  etherealPreviewUrl String?         @db.Text // Preview URL generated from Ethereal SMTP
+  errorMessage       String?         @db.Text
+  retryCount         Int             @default(0)
+  batchId            String?         // Groups leads scheduled together (CSV imports)
+  metadata           Json?           // Additional parameters (per-email delay, headers, tags)
+
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  @@index([status, scheduledAt])
+  @@index([tenantId])
+  @@index([senderAccountId])
+  @@index([userId])
+  @@index([batchId])
+  @@map("email_jobs")
+}
+
+// =========================================================================
+// SLACK INTEGRATION MODEL (Rate-Limit Alerts via OAuth & Webhooks)
+// =========================================================================
+
+model SlackIntegration {
+  id                 String   @id @default(uuid())
+  tenantId           String
+  tenant             Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId             String?
+  user               User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  teamId             String
+  teamName           String?
+  channel            String?
+  channelId          String?
+  incomingWebhookUrl String   @db.Text
+  botAccessToken     String?  @db.Text
+  scopes             String?
+  isActive           Boolean  @default(true)
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([tenantId, teamId])
+  @@index([tenantId])
+  @@index([userId])
+  @@map("slack_integrations")
+}
